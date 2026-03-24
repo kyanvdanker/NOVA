@@ -1,0 +1,41 @@
+# NOVA - Neural Omnipresent Voice Assistant
+# Python 3.10+ required
+
+# ─── Audio ────────────────────────────────────────────────────────────────────
+pyaudio>=0.2.13              # Microphone input
+numpy>=1.24                  # Audio processing
+sounddevice>=0.4.6           # Audio playback
+soundfile>=0.12              # WAV file handling
+
+# ─── Speech-to-Text ───────────────────────────────────────────────────────────
+faster-whisper>=0.10         # Fast Whisper STT (primary)
+# openai-whisper>=20231117   # Alternative Whisper (slower, no CUDA needed)
+
+# ─── Wake Word ────────────────────────────────────────────────────────────────
+openwakeword>=0.6.0          # Wake word detection (primary)
+# Note: On Raspberry Pi, use onnxruntime instead of onnxruntime-gpu
+
+# ─── TTS ──────────────────────────────────────────────────────────────────────
+# Piper TTS: install separately from https://github.com/rhasspy/piper
+# Or install via pip:
+# piper-tts>=1.2.0
+
+# ─── LLM / Brain ──────────────────────────────────────────────────────────────
+requests>=2.31               # Ollama API calls
+# Ollama must be installed separately: https://ollama.ai
+# Then: ollama pull llama3.2-vision
+
+# ─── Memory / Storage ─────────────────────────────────────────────────────────
+chromadb>=0.4.18             # Vector store for semantic memory
+# Note: On Raspberry Pi, chromadb may need extra steps. See README.
+
+# ─── Vision / Screen ──────────────────────────────────────────────────────────
+mss>=9.0.1                   # Fast cross-platform screenshots
+Pillow>=10.0                 # Image processing
+
+# ─── System Control ───────────────────────────────────────────────────────────
+psutil>=5.9                  # CPU/memory/battery info
+pyperclip>=1.8.2             # Clipboard access
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+python-dateutil>=2.8         # Natural date parsing

@@ -1,0 +1,15 @@
+2026-03-24 21:02:38,731 [INFO] nova.main: ============================================================
+2026-03-24 21:02:38,732 [INFO] nova.main:   NOVA - Neural Omnipresent Voice Assistant  
+2026-03-24 21:02:38,732 [INFO] nova.main:   Say 'Hey Nova' to wake me up              
+2026-03-24 21:02:38,733 [INFO] nova.main: ============================================================
+2026-03-24 21:02:38,733 [INFO] nova.main: Initializing NOVA subsystems...
+2026-03-24 21:02:43,927 [INFO] nova.tts: TTS engine: system
+2026-03-24 21:03:39,958 [WARNING] nova.recorder: openwakeword load failed: [ONNXRuntimeError] : 3 : NO_SUCHFILE : Load model from C:\NOVA\.venv\Lib\site-packages\openwakeword\resources/models/alexa_v0.1.onnx failed:Load model C:\NOVA\.venv\Lib\site-packages\openwakeword\resources/models/alexa_v0.1.onnx failed. File doesn't exist
+2026-03-24 21:03:49,475 [INFO] nova.memory: ChromaDB initialized (0 memories)
+2026-03-24 21:03:49,475 [INFO] nova.memory: Memory system initialized
+2026-03-24 21:03:51,678 [INFO] nova.llm: Ollama models available: ['jarvis:latest', 'llama3.2-vision:latest', 'llama3:latest', 'deepseek-coder-v2:latest']
+2026-03-24 21:03:51,752 [INFO] nova.main: All subsystems initialized
+2026-03-24 21:03:52,404 [INFO] nova.recorder: Audio monitoring started
+2026-03-24 21:03:52,411 [INFO] nova.main: Nova is running
+2026-03-24 21:04:26,494 [INFO] nova.main: Shutting down Nova...
+2026-03-24 21:04:36,556 [INFO] nova.main: Nova shutdown complete
