@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 def test_llm():
     """Test LLM connection."""
     print("Testing LLM (Ollama)...")
-    from nova.brain.memory import MemoryManager
-    from nova.brain.llm import LLM
+    from brain.memory import MemoryManager
+    from brain.llm import LLM
     mem = MemoryManager()
     llm = LLM(memory_manager=mem)
     print("Sending test message...")
@@ -30,7 +30,7 @@ def test_llm():
 def test_stt():
     """Test speech-to-text."""
     print("Testing STT (Whisper)...")
-    from nova.audio.stt import STT
+    from audio.stt import STT
     stt = STT()
     print("Say something (recording 4 seconds)...")
     import pyaudio
@@ -54,7 +54,7 @@ def test_stt():
 def test_tts():
     """Test text-to-speech."""
     print("Testing TTS...")
-    from nova.audio.tts import TTS
+    from audio.tts import TTS
     tts = TTS()
     print("Speaking test phrase...")
     tts.speak("Hello! I am Nova, your neural omnipresent voice assistant. I am working correctly.")
@@ -64,7 +64,7 @@ def test_tts():
 def test_memory():
     """Test memory system."""
     print("Testing Memory...")
-    from nova.brain.memory import MemoryManager
+    from brain.memory import MemoryManager
     mem = MemoryManager()
     mem.store_interaction("My name is Test User", "Nice to meet you, Test User!")
     mem.update_profile("name", "Test User")
@@ -80,7 +80,7 @@ def test_memory():
 def test_projects():
     """Test project management."""
     print("Testing Projects...")
-    import nova.skills.projects as proj
+    import skills.projects as proj
     p = proj.create_project("Test Project", "A test project")
     print(f"Created: {p['name']} (id={p['id']})")
     memo = proj.add_memo("Test task", project_id=p["id"], memo_type="task")
@@ -93,7 +93,7 @@ def test_projects():
 def test_laptop():
     """Test laptop control."""
     print("Testing Laptop Control...")
-    from nova.skills.laptop_control import LaptopControl
+    from skills.laptop_control import LaptopControl
     lc = LaptopControl()
     info = lc.get_system_info()
     print(f"System: {info}")
@@ -105,11 +105,11 @@ def test_laptop():
 def test_full():
     """Test full pipeline (text input, no voice)."""
     print("Testing full pipeline (text mode)...")
-    from nova.brain.memory import MemoryManager
-    from nova.brain.llm import LLM
-    from nova.skills.laptop_control import LaptopControl
-    import nova.skills.projects as projects
-    from nova.skills.intent_router import IntentRouter
+    from brain.memory import MemoryManager
+    from brain.llm import LLM
+    from skills.laptop_control import LaptopControl
+    import skills.projects as projects
+    from skills.intent_router import IntentRouter
 
     mem = MemoryManager()
     llm = LLM(memory_manager=mem)
@@ -141,11 +141,11 @@ def interactive():
     print("Nova Interactive Mode (text)")
     print("Type your message. Ctrl+C to exit.\n")
 
-    from nova.brain.memory import MemoryManager
-    from nova.brain.llm import LLM
-    from nova.skills.laptop_control import LaptopControl
-    import nova.skills.projects as projects
-    from nova.skills.intent_router import IntentRouter
+    from brain.memory import MemoryManager
+    from brain.llm import LLM
+    from skills.laptop_control import LaptopControl
+    import skills.projects as projects
+    from skills.intent_router import IntentRouter
 
     mem = MemoryManager()
     llm = LLM(memory_manager=mem)

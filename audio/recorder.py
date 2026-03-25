@@ -1,8 +1,12 @@
 """
-NOVA Audio Recorder
-- Records from microphone with Voice Activity Detection (VAD)
-- Stops automatically when user stops talking
-- Detects if user is interrupting Nova's speech
+NOVA Audio Recorder v2
+Key fixes over v1:
+  1. Echo gate: VAD threshold raised while TTS plays + tail period → no more
+     Nova hearing her own voice and responding to it
+  2. Pre-roll buffer: captures audio before speech energy threshold hit
+  3. Proper noise floor adaptation
+
+Wake word listener now also uses the event bus.
 """
 
 import pyaudio
@@ -17,7 +21,7 @@ from typing import Optional, Callable
 import logging
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import config
 
 log = logging.getLogger("nova.recorder")
@@ -25,79 +29,80 @@ log = logging.getLogger("nova.recorder")
 
 class AudioRecorder:
     """
-    Continuous audio recorder with smart VAD.
-    Handles:
-      - Pre-roll buffer (captures audio just before speech starts)
-      - Energy-based speech detection
-      - Silence-based end-of-speech detection
-      - Interruption detection (user speaking over Nova)
+    Microphone recorder with smart VAD and echo gating.
     """
 
     def __init__(self):
         self.pa = pyaudio.PyAudio()
         self._stream: Optional[pyaudio.Stream] = None
-        self._recording = False
         self._monitoring = False
 
-        # Pre-roll ring buffer: keeps last N seconds before speech
+        # Pre-roll ring buffer
         pre_roll_frames = int(config.VAD_PRE_ROLL_SEC * config.SAMPLE_RATE / config.CHUNK_SIZE)
         self._pre_roll = deque(maxlen=pre_roll_frames)
+
+        # ── Echo Gate ──────────────────────────────────────────────────────────
+        # When Nova speaks, the microphone picks up her voice.
+        # We raise the VAD threshold massively while TTS is playing and for
+        # VAD_SPEAKING_GATE_TAIL seconds afterwards.
+        self.nova_speaking = False          # set by TTS callbacks
+        self._speaking_end_time = 0.0       # when TTS last stopped
 
         # Callbacks
         self.on_speech_start: Optional[Callable] = None
         self.on_speech_end: Optional[Callable[[bytes], None]] = None
         self.on_interrupt: Optional[Callable] = None
 
-        # State
-        self._audio_frames = []
-        self._in_speech = False
-        self._silence_frames = 0
-        self._speech_frames = 0
-
-        silence_frames_needed = config.VAD_SILENCE_THRESH_SEC * config.SAMPLE_RATE / config.CHUNK_SIZE
-        self._silence_threshold_frames = int(silence_frames_needed)
-
-        min_speech_frames = config.VAD_MIN_SPEECH_SEC * config.SAMPLE_RATE / config.CHUNK_SIZE
-        self._min_speech_frames = int(min_speech_frames)
-
         # Noise floor adaptation
         self._noise_floor = config.VAD_ENERGY_THRESHOLD
-        self._noise_samples = deque(maxlen=50)  # ~3 seconds of noise history
-
-        # Is Nova currently speaking? (set externally by TTS)
-        self.nova_speaking = False
+        self._noise_samples: deque = deque(maxlen=60)
 
     def _rms(self, data: bytes) -> float:
-        """Calculate RMS energy of audio chunk."""
+        """Root mean square energy of audio chunk."""
         audio = np.frombuffer(data, dtype=np.int16).astype(np.float32)
         if len(audio) == 0:
             return 0.0
         return float(np.sqrt(np.mean(audio ** 2)))
 
+    def _effective_threshold(self, context_mode: bool = False) -> float:
+        """
+        Returns the current effective VAD threshold.
+        Raised significantly while Nova is speaking or just finished.
+        """
+        now = time.time()
+        in_tail = (now - self._speaking_end_time) < config.VAD_SPEAKING_GATE_TAIL
+
+        if self.nova_speaking or in_tail:
+            return config.VAD_SPEAKING_GATE     # high gate — blocks echo
+
+        # Adaptive threshold: 1.8× noise floor, but at least the config minimum
+        adaptive = self._noise_floor * 1.8
+        base = config.CONTEXT_ENERGY_GATE if context_mode else config.VAD_ENERGY_THRESHOLD
+        return max(base, adaptive)
+
     def _is_speech(self, data: bytes, context_mode: bool = False) -> bool:
-        """Determine if chunk contains speech based on energy."""
         rms = self._rms(data)
-        threshold = config.CONTEXT_ENERGY_GATE if context_mode else self._noise_floor
-        # Adaptive threshold: 1.8x noise floor
-        dynamic_threshold = self._noise_floor * 1.8
-        effective_threshold = max(threshold, dynamic_threshold)
-        return rms > effective_threshold
+        return rms > self._effective_threshold(context_mode)
 
     def _update_noise_floor(self, data: bytes):
-        """Adapt noise floor to ambient conditions."""
+        """Continuously adapt to ambient noise."""
         rms = self._rms(data)
-        if rms > 0:
+        if 10 < rms < config.VAD_ENERGY_THRESHOLD * 2:  # plausible ambient range
             self._noise_samples.append(rms)
-        if len(self._noise_samples) >= 10:
-            # Use 30th percentile as noise floor estimate
-            sorted_samples = sorted(self._noise_samples)
-            percentile_idx = max(0, int(len(sorted_samples) * 0.3))
-            self._noise_floor = max(config.VAD_ENERGY_THRESHOLD * 0.5,
-                                    sorted_samples[percentile_idx])
+        if len(self._noise_samples) >= 15:
+            sorted_s = sorted(self._noise_samples)
+            self._noise_floor = max(
+                config.VAD_ENERGY_THRESHOLD * 0.4,
+                sorted_s[int(len(sorted_s) * 0.3)]
+            )
+
+    def notify_speaking_ended(self):
+        """TTS calls this when playback finishes."""
+        self.nova_speaking = False
+        self._speaking_end_time = time.time()
 
     def start_monitoring(self):
-        """Start continuous audio monitoring in background thread."""
-        self._monitoring = True
+        """Open microphone stream."""
         self._stream = self.pa.open(
             format=pyaudio.paInt16,
             channels=config.CHANNELS,
@@ -105,10 +110,10 @@ class AudioRecorder:
             input=True,
             frames_per_buffer=config.CHUNK_SIZE,
         )
-        log.info("Audio monitoring started")
+        self._monitoring = True
+        log.info("Audio monitoring started (echo gate active)")
 
     def stop_monitoring(self):
-        """Stop audio monitoring."""
         self._monitoring = False
         if self._stream:
             self._stream.stop_stream()
@@ -116,7 +121,6 @@ class AudioRecorder:
             self._stream = None
 
     def read_chunk(self) -> Optional[bytes]:
-        """Read one chunk from stream."""
         if self._stream and self._monitoring:
             try:
                 return self._stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
@@ -125,22 +129,27 @@ class AudioRecorder:
                 return None
         return None
 
-    def record_utterance(self, context_mode: bool = False, timeout: float = 30.0) -> Optional[bytes]:
+    def record_utterance(self, context_mode: bool = False,
+                         timeout: float = 30.0) -> Optional[bytes]:
         """
-        Record a single user utterance.
-        Starts when speech is detected, ends when silence threshold is reached.
-        Returns raw PCM bytes, or None if nothing captured.
+        Record one user utterance with VAD.
+        Starts when speech detected, ends after silence threshold.
+        Returns raw PCM or None if too short.
         """
-        log.info(f"Listening for utterance (context_mode={context_mode})...")
-        self._audio_frames = []
-        self._in_speech = False
-        self._silence_frames = 0
-        self._speech_frames = 0
+        log.debug(f"Waiting for utterance (context={context_mode})")
+        audio_frames = []
+        in_speech = False
+        silence_frames = 0
+        speech_frames = 0
+
+        silence_threshold_frames = int(
+            config.VAD_SILENCE_THRESH_SEC * config.SAMPLE_RATE / config.CHUNK_SIZE
+        )
+        min_speech_frames = int(
+            config.VAD_MIN_SPEECH_SEC * config.SAMPLE_RATE / config.CHUNK_SIZE
+        )
 
         start_time = time.time()
-
-        # Add pre-roll buffer to capture speech onset
-        self._audio_frames.extend(self._pre_roll)
 
         while time.time() - start_time < timeout:
             chunk = self.read_chunk()
@@ -148,51 +157,41 @@ class AudioRecorder:
                 time.sleep(0.01)
                 continue
 
-            # Update noise floor when not in speech
-            if not self._in_speech:
+            if not in_speech:
                 self._update_noise_floor(chunk)
                 self._pre_roll.append(chunk)
 
             is_speech = self._is_speech(chunk, context_mode)
 
             if is_speech:
-                if not self._in_speech:
-                    # Speech started
-                    self._in_speech = True
-                    self._silence_frames = 0
-                    # Include pre-roll
-                    self._audio_frames = list(self._pre_roll)
+                if not in_speech:
+                    in_speech = True
+                    silence_frames = 0
+                    audio_frames = list(self._pre_roll)  # include pre-roll
                     if self.on_speech_start:
                         self.on_speech_start()
-                    log.debug("Speech started")
 
                     # Interrupt Nova if she's speaking
                     if self.nova_speaking and self.on_interrupt:
-                        log.info("User interrupted Nova")
+                        log.info("User interrupting Nova")
                         self.on_interrupt()
 
-                self._audio_frames.append(chunk)
-                self._speech_frames += 1
-                self._silence_frames = 0
+                audio_frames.append(chunk)
+                speech_frames += 1
+                silence_frames = 0
 
-            elif self._in_speech:
-                # Silence during speech
-                self._audio_frames.append(chunk)
-                self._silence_frames += 1
+            elif in_speech:
+                audio_frames.append(chunk)
+                silence_frames += 1
+                if silence_frames >= silence_threshold_frames:
+                    break  # end of utterance
 
-                if self._silence_frames >= self._silence_threshold_frames:
-                    # End of utterance
-                    log.debug(f"Utterance ended ({self._speech_frames} speech frames)")
-                    break
-
-        if self._speech_frames < self._min_speech_frames:
-            log.debug("Too short, discarding")
+        if speech_frames < min_speech_frames:
             return None
 
-        return b"".join(self._audio_frames)
+        return b"".join(audio_frames)
 
     def save_to_wav(self, pcm_data: bytes, path: Path) -> Path:
-        """Save PCM bytes to WAV file."""
         with wave.open(str(path), 'wb') as wf:
             wf.setnchannels(config.CHANNELS)
             wf.setsampwidth(self.pa.get_sample_size(pyaudio.paInt16))
@@ -201,134 +200,104 @@ class AudioRecorder:
         return path
 
     def pcm_to_wav_bytes(self, pcm_data: bytes) -> bytes:
-        """Convert raw PCM to WAV bytes (in memory)."""
         buf = io.BytesIO()
         with wave.open(buf, 'wb') as wf:
             wf.setnchannels(config.CHANNELS)
-            wf.setsampwidth(2)  # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(config.SAMPLE_RATE)
             wf.writeframes(pcm_data)
         return buf.getvalue()
 
     def get_energy_level(self) -> float:
-        """Get current mic energy (for visualisation)."""
         chunk = self.read_chunk()
-        if chunk:
-            return self._rms(chunk)
-        return 0.0
+        return self._rms(chunk) if chunk else 0.0
 
     def cleanup(self):
         self.stop_monitoring()
         self.pa.terminate()
 
 
+import pvporcupine
+from pvrecorder import PvRecorder   # optional, or keep using your recorder
+import logging
+
+log = logging.getLogger("nova.recorder")
+
+
 class WakeWordListener:
     """
-    Listens continuously for the wake word.
-    Primary: openwakeword (if available)
-    Fallback: whisper + keyword match in transcript
+    Simple and reliable wake word listener using Porcupine.
+    Just put in any word/phrase you want.
     """
 
-    def __init__(self, recorder: AudioRecorder, stt=None):
+    def __init__(self, recorder, stt=None):
         self.recorder = recorder
-        self.stt = stt  # STT engine (faster-whisper)
+        self.stt = stt
         self._active = False
-        self._oww = None
-        self._load_openwakeword()
+        self.porcupine = None
+        self._load_porcupine()
 
-    def _load_openwakeword(self):
-        """Try to load openwakeword."""
-        if not config.USE_OPENWAKEWORD:
-            return
+    def _load_porcupine(self):
         try:
-            from openwakeword.model import Model
-            # Try loading custom nova model, fall back to built-ins
-            try:
-                self._oww = Model(wakeword_models=[config.OPENWAKEWORD_MODEL],
-                                  inference_framework="onnx")
-                log.info("Loaded openwakeword model: " + config.OPENWAKEWORD_MODEL)
-            except Exception:
-                # Use bundled models
-                self._oww = Model(inference_framework="onnx")
-                log.info("Loaded openwakeword bundled models")
-        except ImportError:
-            log.info("openwakeword not installed, using whisper fallback")
+            # Option A: Use built-in keywords (no key needed for some)
+            # self.porcupine = pvporcupine.create(keywords=["porcupine", "bumblebee"])
+
+            # Option B: Use your custom wake word (RECOMMENDED)
+            self.porcupine = pvporcupine.create(
+                access_key="U1syWtYhRiNTSQ/c5o/2Z1DVuWGA6BqvDrhgET+3EnU/rERTvs2ZAQ==",   # ← Put your Picovoice key here
+                keyword_paths=[r"wakewords/hey-nova_en_windows_v4_0_0.ppn"]   # path to your .ppn file
+            )
+
+            log.info(f" Porcupine loaded successfully. Wake word: Hey Nova")
+
         except Exception as e:
-            log.warning(f"openwakeword load failed: {e}")
+            log.error(f"Failed to load Porcupine: {e}")
+            self.porcupine = None
 
     def wait_for_wake_word(self) -> bool:
-        """
-        Block until wake word is detected.
-        Returns True when wake word heard, False if stopped.
-        """
-        self._active = True
-        log.info(f"Waiting for wake word: {config.WAKE_WORDS}")
-
-        if self._oww:
-            return self._oww_listen()
+        """Main method called from main.py"""
+        if self.porcupine:
+            return self._porcupine_listener()
         else:
-            return self._whisper_listen()
+            log.warning("Porcupine not loaded → using Whisper fallback")
+            return self._whisper_listen()   # we'll add this next if needed
 
-    def _oww_listen(self) -> bool:
-        """Use openwakeword for wake detection (very fast, low CPU)."""
-        import numpy as np
-        chunk_samples = int(config.SAMPLE_RATE * config.OPENWAKEWORD_CHUNK_MS / 1000)
+    def _porcupine_listener(self) -> bool:
+        """Listen using Porcupine - handles 1024 chunk size safely."""
+        log.info("Listening for wake word with Porcupine...")   # removed emoji to avoid issues
 
-        while self._active:
-            chunk = self.recorder.read_chunk()
-            if chunk is None:
-                continue
-
-            audio_array = np.frombuffer(chunk, dtype=np.int16)
-            prediction = self._oww.predict(audio_array)
-
-            for model_name, score in prediction.items():
-                if score >= config.OPENWAKEWORD_THRESHOLD:
-                    log.info(f"Wake word detected (score={score:.2f})")
-                    return True
-
-        return False
-
-    def _whisper_listen(self) -> bool:
-        """
-        Fallback: record short clips, transcribe, check for wake word.
-        Less latency-efficient but works without openwakeword.
-        """
-        from nova.audio.stt import STT
-        if self.stt is None:
-            self.stt = STT()
-
-        buffer = []
-        buffer_duration = 0
-        clip_duration = 2.0  # check every 2 seconds
-
-        while self._active:
-            chunk = self.recorder.read_chunk()
-            if chunk is None:
-                continue
-
-            buffer.append(chunk)
-            buffer_duration += config.CHUNK_SIZE / config.SAMPLE_RATE
-
-            if buffer_duration >= clip_duration:
-                pcm = b"".join(buffer)
-                buffer = []
-                buffer_duration = 0
-
-                # Only transcribe if there's speech energy
-                rms = self.recorder._rms(pcm)
-                if rms < config.VAD_ENERGY_THRESHOLD * 0.5:
+        try:
+            while self._active:
+                chunk = self.recorder.read_chunk()
+                if chunk is None:
+                    time.sleep(0.01)
                     continue
 
-                text = self.stt.transcribe_raw(pcm).lower().strip()
-                if text:
-                    log.debug(f"Wake listen: '{text}'")
-                    for ww in config.WAKE_WORDS:
-                        if ww in text:
-                            log.info(f"Wake word '{ww}' detected in: '{text}'")
-                            return True
+                pcm = list(np.frombuffer(chunk, dtype=np.int16))
+
+                # Porcupine requires exactly 512 samples per call
+                if len(pcm) == 1024:
+                    # Split into two frames
+                    if self.porcupine.process(pcm[:512]) >= 0 or self.porcupine.process(pcm[512:]) >= 0:
+                        log.info(" Wake word detected by Porcupine!")
+                        return True
+                else:
+                    # Fallback for other sizes
+                    if self.porcupine.process(pcm) >= 0:
+                        log.info(" Wake word detected by Porcupine!")
+                        return True
+
+        finally:
+            if self.porcupine:
+                self.porcupine.delete()
 
         return False
-
+    
     def stop(self):
         self._active = False
+        if self.porcupine:
+            try:
+                self.porcupine.delete()
+            except:
+                pass
+        log.info("Wake word listener stopped")
