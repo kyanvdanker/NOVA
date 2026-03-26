@@ -1,0 +1,22 @@
+NOVA/
+├── main.py
+├── requirements.txt
+├── README.md
+├── config/
+│   ├── __init__.py
+│   └── settings.py
+├── core/
+│   ├── __init__.py
+│   ├── assistant.py
+│   ├── voice.py
+│   ├── memory.py
+│   ├── computer_control.py
+│   ├── self_improvement.py
+│   ├── projects.py
+│   └── agenda.py
+├── data/
+│   ├── projects/
+│   ├── memos/
+│   └── logs/
+└── skills/
+    └── custom_skills.py
