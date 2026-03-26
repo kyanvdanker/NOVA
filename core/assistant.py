@@ -20,8 +20,13 @@ from core.computer_control import ComputerControl
 from core.projects import ProjectManager
 from core.agenda import AgendaManager
 from core.self_improvement import SelfImprovement
-from core.tools import run_code_tool, search_tool
-
+from core.tools import (
+    run_code_tool, search_tool, weather_tool, calculate_tool, unit_convert_tool,
+    hash_tool, encode_tool, json_tool, regex_tool, diff_tool, network_tool,
+    file_tool, clipboard_tool, system_info_tool, process_tool, timer_tool,
+    datetime_tool, price_tool, currency_tool, translate_tool, text_tool,
+    qr_tool, git_tool, package_tool, generate_tool, text_analyze_tool
+)
 
 # Tool regex: matches TOOL: <NAME> | <JSON>
 TOOL_PATTERN = re.compile(r"TOOL:\s*(\w+)\s*\|\s*(\{.*?\})", re.DOTALL)
@@ -32,18 +37,25 @@ class NOVAAssistant:
         self.memory = Memory()
         self.computer = ComputerControl()
         self.projects = ProjectManager()
-        self.voice = None  # Set after voice init
+        self.voice = None
         self._session_id = f"session_{int(time.time())}"
         self.agenda = AgendaManager(self.memory)
         self.self_improve = SelfImprovement(self.memory, assistant_ref=self)
         self._initialized = False
+        # For GUI streaming callbacks
+        self._stream_callbacks: List = []
+
+    def add_stream_callback(self, cb):
+        self._stream_callbacks.append(cb)
+
+    def remove_stream_callback(self, cb):
+        self._stream_callbacks.discard(cb) if hasattr(self._stream_callbacks, 'discard') else None
 
     def set_voice(self, voice_engine):
         self.voice = voice_engine
         self.agenda.speak = voice_engine.speak if voice_engine else None
 
     async def initialize(self):
-        """Check Ollama is running and model is available."""
         print(f"  🔗 Connecting to Ollama ({OLLAMA_HOST})...")
         for attempt in range(5):
             try:
@@ -58,7 +70,7 @@ class NOVAAssistant:
                 break
             except requests.exceptions.ConnectionError:
                 if attempt == 4:
-                    print(f"  ❌ Cannot connect to Ollama. Start it with: ollama serve")
+                    print("  ❌ Cannot connect to Ollama. Start it with: ollama serve")
                 else:
                     print(f"  ⏳ Waiting for Ollama... ({attempt+1}/5)")
                     await asyncio.sleep(3)
@@ -66,16 +78,14 @@ class NOVAAssistant:
                 print(f"  ⚠️  Ollama check error: {e}")
                 break
 
-        # Start background services
         self.agenda.start_reminder_checker()
         self.self_improve.start()
         self._initialized = True
 
     async def run(self):
-        """Main interaction loop — text mode."""
         print(f"\n  {'='*50}")
         print(f"  {ASSISTANT_NAME} is online. Type your message.")
-        print(f"  Commands: /agenda, /projects, /memos, /skills, /status, /exit")
+        print(f"  Commands: /agenda, /projects, /memos, /skills, /status, /tools, /exit")
         print(f"  {'='*50}\n")
 
         while True:
@@ -83,49 +93,41 @@ class NOVAAssistant:
                 user_input = input(f"  You: ").strip()
                 if not user_input:
                     continue
-
-                # Handle slash commands
                 if user_input.startswith("/"):
                     await self._handle_slash_command(user_input)
                     continue
-
                 if user_input.lower() in ("exit", "quit", "/exit"):
                     print(f"  {ASSISTANT_NAME}: Goodbye, {USER_NAME}.")
                     break
-
                 await self.handle_input(user_input, voice_response=False)
-
             except (KeyboardInterrupt, EOFError):
                 print(f"\n  {ASSISTANT_NAME}: Shutting down. See you, {USER_NAME}.")
                 break
 
     async def handle_input(self, text: str, voice_response: bool = False) -> str:
-        """Process user input and return response."""
         start_time = time.time()
-
-        # Save to memory
         self.memory.add_message("user", text, self._session_id)
-
-        # Get conversation history
         history = self.memory.get_recent_messages(n=15, session_id=self._session_id)
-
-        # Build messages
         messages = self._build_messages(history)
 
         print(f"\n  {ASSISTANT_NAME}: ", end="", flush=True)
 
         full_response = ""
-        tool_results = []
-
-        # Stream response
         async for chunk in self._stream_response(messages):
             print(chunk, end="", flush=True)
             full_response += chunk
+            # Notify GUI callbacks
+            for cb in self._stream_callbacks:
+                try:
+                    cb("chunk", chunk)
+                except:
+                    pass
 
-        print()  # newline after streaming
+        print()
 
-        # Extract and execute tools
+        # Execute tools
         tool_calls = TOOL_PATTERN.findall(full_response)
+        tool_results = []
         if tool_calls:
             clean_response = TOOL_PATTERN.sub("", full_response).strip()
             for tool_name, tool_args_str in tool_calls:
@@ -137,76 +139,75 @@ class NOVAAssistant:
                 result = await self._execute_tool(tool_name, tool_args)
                 tool_results.append({"tool": tool_name, "result": result})
 
-                # Print tool result
-                result_preview = json.dumps(result)[:200]
+                result_preview = json.dumps(result)[:300]
                 print(f"  ⚡ [{tool_name}] → {result_preview}")
+                for cb in self._stream_callbacks:
+                    try:
+                        cb("tool_result", {"tool": tool_name, "result": result})
+                    except:
+                        pass
 
-            # If there are tool results, get follow-up response
             if tool_results:
                 tool_summary = "\n".join([
-                    f"Tool {t['tool']} returned: {json.dumps(t['result'])[:300]}"
+                    f"Tool {t['tool']} returned: {json.dumps(t['result'])[:400]}"
                     for t in tool_results
                 ])
                 follow_up_messages = messages + [
                     {"role": "assistant", "content": full_response},
-                    {"role": "user", "content": f"Tool results:\n{tool_summary}\nPlease provide a natural response based on these results."}
+                    {"role": "user", "content": f"Tool results:\n{tool_summary}\n\nProvide a natural, concise response based on these results."}
                 ]
                 follow_up = ""
                 print(f"\n  {ASSISTANT_NAME}: ", end="", flush=True)
                 async for chunk in self._stream_response(follow_up_messages):
                     print(chunk, end="", flush=True)
                     follow_up += chunk
+                    for cb in self._stream_callbacks:
+                        try:
+                            cb("chunk", chunk)
+                        except:
+                            pass
                 print()
                 full_response = follow_up
         else:
             clean_response = full_response
 
-        # Save response
         self.memory.add_message("assistant", full_response, self._session_id)
 
-        # Voice response
+        for cb in self._stream_callbacks:
+            try:
+                cb("done", full_response)
+            except:
+                pass
+
         if voice_response and self.voice:
-            # Clean up text for speech
             spoken = self._clean_for_speech(clean_response or full_response)
             if spoken:
                 asyncio.create_task(self.voice.speak(spoken))
 
-        # Log interaction
         duration_ms = int((time.time() - start_time) * 1000)
         tool_used = tool_calls[0][0] if tool_calls else None
-        self.memory.log_interaction(
-            intent=text[:50],
-            tool_used=tool_used,
-            success=True,
-            duration_ms=duration_ms
-        )
-
+        self.memory.log_interaction(intent=text[:50], tool_used=tool_used,
+                                     success=True, duration_ms=duration_ms)
         return full_response
 
     def _build_messages(self, history: List[Dict]) -> List[Dict]:
-        """Build message list for Ollama."""
-        # Add facts as context
         facts = self.memory.get_all_facts()
         facts_str = ""
         if facts:
-            facts_str = "\nKnown facts:\n" + "\n".join(f"- {k}: {v}" for k, v in list(facts.items())[:10])
+            facts_str = "\n\nKnown facts about you and the user:\n" + \
+                        "\n".join(f"- {k}: {v}" for k, v in list(facts.items())[:10])
 
         system = SYSTEM_PROMPT + facts_str
-
         messages = [{"role": "system", "content": system}]
 
-        # Add conversation history (skip the very last user message — it's already in history)
         for msg in history[:-1]:
             messages.append({"role": msg["role"], "content": msg["content"]})
-
-        # Add latest user message
         if history:
             messages.append({"role": history[-1]["role"], "content": history[-1]["content"]})
 
         return messages
 
     async def _stream_response(self, messages: List[Dict]) -> AsyncGenerator[str, None]:
-        """Stream tokens from Ollama."""
         try:
             loop = asyncio.get_event_loop()
             response_queue = asyncio.Queue()
@@ -219,13 +220,9 @@ class NOVAAssistant:
                             "model": OLLAMA_MODEL,
                             "messages": messages,
                             "stream": True,
-                            "options": {
-                                "temperature": LLM_TEMPERATURE,
-                                "num_ctx": OLLAMA_CONTEXT_LENGTH
-                            }
+                            "options": {"temperature": LLM_TEMPERATURE, "num_ctx": OLLAMA_CONTEXT_LENGTH}
                         },
-                        stream=True,
-                        timeout=120
+                        stream=True, timeout=120
                     )
                     for line in resp.iter_lines():
                         if line:
@@ -242,7 +239,6 @@ class NOVAAssistant:
                     loop.call_soon_threadsafe(response_queue.put_nowait, f"[Error: {e}]")
                     loop.call_soon_threadsafe(response_queue.put_nowait, None)
 
-            # Run request in thread
             import threading
             t = threading.Thread(target=_request, daemon=True)
             t.start()
@@ -257,10 +253,12 @@ class NOVAAssistant:
             yield f"[LLM Error: {e}]"
 
     async def _execute_tool(self, tool_name: str, args: Dict) -> Dict:
-        """Route tool calls to appropriate handler."""
+        """Route tool calls to the appropriate handler."""
         tool_name = tool_name.upper()
+        # Extract 'action' but keep the rest of args intact
         action = args.pop("action", "")
 
+        # ── Core system tools ──
         if tool_name == "COMPUTER_CONTROL":
             return self.computer.execute(action, args)
 
@@ -277,22 +275,105 @@ class NOVAAssistant:
             return self._handle_self_improve(action, args)
 
         elif tool_name == "SYSTEM":
+            # Route to system_info or computer control
+            if action in ("overview", "processes", "battery", "temperatures", "network_interfaces"):
+                return system_info_tool({"action": action, **args})
             return self.computer.execute(action, args)
 
         elif tool_name == "MEMORY":
             return self._handle_memory(action, args)
 
         elif tool_name == "CUSTOM_SKILL":
-            skill_name = args.pop("skill", "")
+            skill_name = args.pop("skill", action)
             return self.self_improve.execute_custom_skill(skill_name, args)
 
+        # ── New tools ──
         elif tool_name == "CODE":
-            return run_code_tool(args)
+            args["action"] = action
+            return run_code_tool({"language": args.get("language", "python"),
+                                   "code": args.get("code", "")})
 
         elif tool_name == "SEARCH":
-            return search_tool(args)
+            return search_tool({"query": args.get("query", action)})
+
+        elif tool_name == "WEATHER":
+            return weather_tool({"city": args.get("city", args.get("location", action or "Amsterdam"))})
+
+        elif tool_name == "CALCULATE":
+            return calculate_tool({"expression": args.get("expression", args.get("expr", action))})
+
+        elif tool_name == "UNIT_CONVERT":
+            return unit_convert_tool(args)
+
+        elif tool_name == "HASH":
+            return hash_tool(args)
+
+        elif tool_name == "ENCODE":
+            return encode_tool(args)
+
+        elif tool_name == "JSON_TOOLS":
+            return json_tool({"action": action, **args})
+
+        elif tool_name == "REGEX":
+            return regex_tool({"action": action, **args})
+
+        elif tool_name == "DIFF":
+            return diff_tool({"action": action, **args})
+
+        elif tool_name == "NETWORK":
+            return network_tool({"action": action, **args})
+
+        elif tool_name == "FILE":
+            return file_tool({"action": action, **args})
+
+        elif tool_name == "CLIPBOARD":
+            return clipboard_tool({"action": action, **args})
+
+        elif tool_name == "PROCESS":
+            return process_tool({"action": action, **args})
+
+        elif tool_name == "TIMER":
+            return timer_tool({"action": action, **args})
+
+        elif tool_name == "DATETIME":
+            return datetime_tool({"action": action, **args})
+
+        elif tool_name == "PRICE":
+            return price_tool({"action": action, **args})
+
+        elif tool_name == "CURRENCY":
+            return currency_tool(args)
+
+        elif tool_name == "TRANSLATE":
+            return translate_tool(args)
+
+        elif tool_name == "TEXT":
+            return text_tool({"action": action, **args})
+
+        elif tool_name == "QR":
+            return qr_tool({"action": action, **args})
+
+        elif tool_name == "GIT":
+            return git_tool({"action": action, **args})
+
+        elif tool_name == "PACKAGE":
+            return package_tool({"action": action, **args})
+
+        elif tool_name == "GENERATE":
+            return generate_tool({"action": action, **args})
+
+        elif tool_name == "TEXT_ANALYZE":
+            return text_analyze_tool({"action": action, **args})
+
+        elif tool_name == "OCR":
+            from core.tools import ocr_tool
+            return ocr_tool(args)
 
         else:
+            # Try custom skills as fallback
+            custom = self.self_improve.get_custom_skills()
+            if tool_name.lower() in custom:
+                return self.self_improve.execute_custom_skill(tool_name.lower(), args)
             return {"error": f"Unknown tool: {tool_name}"}
 
     async def _handle_memo(self, action: str, args: Dict) -> Dict:
@@ -318,8 +399,7 @@ class NOVAAssistant:
         if action == "status":
             return self.self_improve.get_status()
         elif action == "run_cycle":
-            result = self.self_improve.force_cycle()
-            return {"result": result}
+            return {"result": self.self_improve.force_cycle()}
         elif action == "list_skills":
             return {"skills": list(self.self_improve.get_custom_skills().keys())}
         return {"error": f"Unknown action: {action}"}
@@ -335,25 +415,18 @@ class NOVAAssistant:
         return {"error": f"Unknown action: {action}"}
 
     def _clean_for_speech(self, text: str) -> str:
-        """Clean response text for TTS — remove markdown, code blocks, etc."""
-        import re
-        # Remove code blocks
-        text = re.sub(r"```[\s\S]*?```", " [code block omitted] ", text)
+        text = re.sub(r"```[\s\S]*?```", " [code block] ", text)
         text = re.sub(r"`[^`]+`", "", text)
-        # Remove markdown
         text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
         text = re.sub(r"\*(.*?)\*", r"\1", text)
         text = re.sub(r"#+\s", "", text)
         text = re.sub(r"\[.*?\]\(.*?\)", "", text)
-        # Remove tool calls
         text = TOOL_PATTERN.sub("", text)
-        # Limit length for quick response
         sentences = text.split(".")
         spoken = ". ".join(sentences[:4]).strip()
         return spoken[:500] if spoken else text[:200]
 
     async def _handle_slash_command(self, cmd: str):
-        """Handle quick slash commands."""
         parts = cmd.strip("/").split()
         command = parts[0].lower()
 
@@ -365,7 +438,7 @@ class NOVAAssistant:
             if projs:
                 print(f"\n  📁 Projects ({len(projs)}):")
                 for p in projs:
-                    print(f"    • {p['name']} [{p.get('status', '?')}] — {p.get('description', '')[:50]}")
+                    print(f"    • {p['name']} [{p.get('status', '?')}]")
             else:
                 print("  No projects yet.")
             print()
@@ -380,32 +453,37 @@ class NOVAAssistant:
             print()
         elif command == "skills":
             status = self.self_improve.get_status()
-            print(f"\n  🧠 Self-Improvement Status:")
-            print(f"    Cycles completed: {status['cycles_completed']}")
-            print(f"    Custom skills: {status['custom_skills']}")
-            print(f"    Total interactions: {status['total_interactions']}")
+            print(f"\n  🧠 Self-Improvement: {status['cycles_completed']} cycles | "
+                  f"{len(status['custom_skills'])} custom skills")
+            for skill in status['custom_skills']:
+                print(f"    • {skill}")
             print()
         elif command == "status":
-            info = self.computer.execute("get_system_info", {})
-            print(f"\n  💻 System Status:")
-            print(json.dumps(info, indent=4))
+            info = system_info_tool({"action": "overview"})
+            print(f"\n  💻 System:")
+            print(f"    CPU: {info.get('cpu_percent', '?')}% | "
+                  f"RAM: {info.get('memory', {}).get('percent', '?')}% | "
+                  f"Disk: {info.get('disk', {}).get('percent', '?')}%")
+            print(f"    Uptime: {info.get('uptime', '?')}")
             print()
+        elif command == "tools":
+            print("""
+  Available tools:
+    COMPUTER_CONTROL, MEMO, AGENDA, PROJECT_MANAGER, CODE, SEARCH
+    WEATHER, CALCULATE, UNIT_CONVERT, HASH, ENCODE, JSON_TOOLS
+    REGEX, DIFF, NETWORK, FILE, CLIPBOARD, PROCESS, TIMER
+    DATETIME, PRICE, CURRENCY, TRANSLATE, TEXT, QR, GIT
+    PACKAGE, GENERATE, TEXT_ANALYZE, SYSTEM, MEMORY
+    SELF_IMPROVE, CUSTOM_SKILL
+            """)
         elif command == "help":
             print("""
-  Available commands:
-    /agenda     — Show today's agenda
-    /projects   — List all projects
-    /memos      — List all memos
-    /skills     — Self-improvement status
-    /status     — System info
-    /help       — This message
-    /exit       — Quit NOVA
+  Commands: /agenda /projects /memos /skills /status /tools /help /exit
             """)
         else:
             print(f"  Unknown command: /{command}")
 
     async def shutdown(self):
-        """Graceful shutdown."""
         print(f"  {ASSISTANT_NAME}: Saving state...")
         self.agenda.stop()
         self.self_improve.stop()

@@ -6,35 +6,33 @@
 ██   ██║██╔══██║██╔══██╗╚██╗ ██╔╝██║╚════██║
 ╚█████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║███████║
  ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝
-
  Your personal AI engineering companion.
- Powered by Ollama + Gemma3 | Voice-first | Self-improving
 """
 import asyncio
 import signal
 import sys
 import os
 import argparse
+import threading
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config.settings import ASSISTANT_NAME, USER_NAME, OLLAMA_MODEL
+from config.settings import ASSISTANT_NAME, USER_NAME, OLLAMA_MODEL, GUI_HOST, GUI_PORT
 
 
 def print_banner():
     print("""
 ╔══════════════════════════════════════════════════════╗
-║  ██╗ █████╗ ██████╗ ██╗   ██╗██╗███████╗            ║
-║  ██║██╔══██╗██╔══██╗██║   ██║██║██╔════╝            ║
-║  ██║███████║██████╔╝██║   ██║██║███████╗            ║
-║  ██║██╔══██║██╔══██╗╚██╗ ██╔╝██║╚════██║            ║
-║  ██║██║  ██║██║  ██║ ╚████╔╝ ██║███████║            ║
-║  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝            ║
+║  ██████╗  ██████╗ ██╗   ██╗ █████╗                  ║
+║  ██╔══██╗██╔═══██╗██║   ██║██╔══██╗                 ║
+║  ██║  ██║██║   ██║██║   ██║███████║                 ║
+║  ██║  ██║██║   ██║╚██╗ ██╔╝██╔══██║                 ║
+║  ██████╔╝╚██████╔╝ ╚████╔╝ ██║  ██║                 ║
+║  ╚═════╝  ╚═════╝   ╚═══╝  ╚═╝  ╚═╝                 ║
 ║                                                      ║
-║  Personal AI Engineering Companion                   ║
-║  Powered by Ollama + Gemma3                          ║
+║  Personal AI Engineering Companion v2.0              ║
+║  Powered by Ollama + Local LLM                       ║
 ╚══════════════════════════════════════════════════════╝
 """)
 
@@ -46,11 +44,10 @@ async def main(args):
 
     assistant = NOVAAssistant()
 
-    # Initialize Ollama connection
     print("🚀 Initializing NOVA...\n")
     await assistant.initialize()
 
-    # Voice mode
+    # Start voice if requested
     if not args.no_voice:
         try:
             from core.voice import VoiceEngine
@@ -58,34 +55,58 @@ async def main(args):
             voice = VoiceEngine()
             voice.initialize()
             assistant.set_voice(voice)
-
-            if args.voice:
-                # Voice-first mode with wake word
-                await run_voice_mode(assistant, voice)
-            else:
-                # Text mode with voice responses
-                await assistant.run()
         except ImportError as e:
-            print(f"  ⚠️  Voice dependencies missing ({e}). Running in text mode.")
-            await assistant.run()
+            print(f"  ⚠️  Voice dependencies missing ({e}). Voice disabled.")
         except Exception as e:
-            print(f"  ⚠️  Voice init failed ({e}). Running in text mode.")
+            print(f"  ⚠️  Voice init failed ({e}). Voice disabled.")
+
+    # GUI mode
+    if args.gui:
+        loop = asyncio.get_event_loop()
+        try:
+            from app import run_gui
+        except ImportError:
+            print("  ⚠️  GUI dependencies missing. Install: pip install flask flask-socketio")
+            print("  Falling back to text mode.")
             await assistant.run()
+            await assistant.shutdown()
+            return
+
+        # Run Flask in a separate thread; keep the async loop here
+        gui_thread = threading.Thread(
+            target=run_gui,
+            args=(assistant, loop),
+            kwargs={"host": GUI_HOST, "port": GUI_PORT},
+            daemon=True
+        )
+        gui_thread.start()
+
+        print(f"\n  🌐 GUI running at http://{GUI_HOST}:{GUI_PORT}")
+        print(f"  Press Ctrl+C to stop.\n")
+
+        if args.voice and assistant.voice:
+            await run_voice_mode(assistant, assistant.voice)
+        else:
+            # Keep async loop alive
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass
+
+    elif args.voice and assistant.voice:
+        await run_voice_mode(assistant, assistant.voice)
     else:
-        # Pure text mode
         await assistant.run()
 
     await assistant.shutdown()
 
 
 async def run_voice_mode(assistant, voice):
-    """Voice interaction loop with wake word detection."""
     from config.settings import ASSISTANT_NAME, USER_NAME
-    import threading
 
-    print(f"\n  🎙️  Voice mode active.")
-    print(f"  Say '{ASSISTANT_NAME}' to activate, or type text below.")
-    print(f"  Ctrl+C to quit.\n")
+    print(f"\n  🎙️  Voice mode active. Say the wake word to activate.")
+    print(f"  You can also type below. Ctrl+C to quit.\n")
 
     wake_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -93,10 +114,8 @@ async def run_voice_mode(assistant, voice):
     def on_wake():
         loop.call_soon_threadsafe(wake_event.set)
 
-    # Start wake word listener in background
     voice.start_wake_word_listener(on_wake)
 
-    # Also allow text input in parallel
     input_queue = asyncio.Queue()
 
     def text_input_loop():
@@ -104,36 +123,34 @@ async def run_voice_mode(assistant, voice):
             try:
                 text = input("  You (text): ").strip()
                 if text:
-                    asyncio.get_event_loop().call_soon_threadsafe(
-                        input_queue.put_nowait, text
-                    )
+                    loop.call_soon_threadsafe(input_queue.put_nowait, text)
             except (KeyboardInterrupt, EOFError):
                 break
 
-    import threading
     input_thread = threading.Thread(target=text_input_loop, daemon=True)
     input_thread.start()
 
-    await voice.speak(f"Hello {USER_NAME}. I'm online and ready.")
+    try:
+        await voice.speak(f"Hello {USER_NAME}. NOVA is online and ready.")
+    except:
+        pass
 
     while True:
-        # Wait for either wake word or text input
         wake_task = asyncio.create_task(wake_event.wait())
         text_task = asyncio.create_task(input_queue.get())
 
         done, pending = await asyncio.wait(
-            [wake_task, text_task],
-            return_when=asyncio.FIRST_COMPLETED
+            [wake_task, text_task], return_when=asyncio.FIRST_COMPLETED
         )
-
-        # Cancel pending tasks
         for task in pending:
             task.cancel()
 
         if wake_task in done and wake_event.is_set():
             wake_event.clear()
-            # Wake word triggered
-            await voice.speak("Yes?")
+            try:
+                await voice.speak("Yes?")
+            except:
+                pass
             print("  🎙️  Listening...", end="", flush=True)
             audio = await asyncio.get_event_loop().run_in_executor(
                 None, voice.record_until_silence
@@ -156,47 +173,38 @@ async def run_voice_mode(assistant, voice):
                 text = text_task.result()
                 if text.lower() in ("exit", "quit", "/exit"):
                     break
-                await assistant.handle_input(text, voice_response=True)
+                await assistant.handle_input(text, voice_response=bool(voice))
             except asyncio.CancelledError:
                 pass
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="NOVA — Personal AI Engineering Companion"
-    )
-    parser.add_argument(
-        "--voice", "-v",
-        action="store_true",
-        help="Enable voice mode with wake word detection"
-    )
-    parser.add_argument(
-        "--no-voice",
-        action="store_true",
-        help="Disable all voice features (text-only mode)"
-    )
-    parser.add_argument(
-        "--model", "-m",
-        default=OLLAMA_MODEL,
-        help=f"Ollama model to use (default: {OLLAMA_MODEL})"
-    )
-    parser.add_argument(
-        "--name",
-        default=USER_NAME,
-        help=f"Your name (default: {USER_NAME})"
-    )
+    parser = argparse.ArgumentParser(description="NOVA — Personal AI Engineering Companion")
+    parser.add_argument("--gui", "-g", action="store_true",
+                        help="Launch the web GUI (opens http://localhost:5000)")
+    parser.add_argument("--voice", "-v", action="store_true",
+                        help="Enable voice mode with wake word detection")
+    parser.add_argument("--no-voice", action="store_true",
+                        help="Disable all voice features")
+    parser.add_argument("--model", "-m", default=OLLAMA_MODEL,
+                        help=f"Ollama model (default: {OLLAMA_MODEL})")
+    parser.add_argument("--name", default=USER_NAME,
+                        help=f"Your name (default: {USER_NAME})")
+    parser.add_argument("--port", type=int, default=GUI_PORT,
+                        help=f"GUI port (default: {GUI_PORT})")
 
     args = parser.parse_args()
 
-    # Override settings from args
     if args.model:
         import config.settings as s
         s.OLLAMA_MODEL = args.model
     if args.name:
         import config.settings as s
         s.USER_NAME = args.name
+    if args.port:
+        import config.settings as s
+        s.GUI_PORT = args.port
 
-    # Graceful Ctrl+C
     def handle_interrupt(sig, frame):
         print(f"\n\n  Shutting down {ASSISTANT_NAME}...")
         sys.exit(0)
