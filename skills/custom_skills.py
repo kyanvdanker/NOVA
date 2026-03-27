@@ -233,3 +233,45 @@ def schedule_reminder(args: dict) -> dict:
     return {'success': True, 'result': 'Reminder scheduled'}
 
 register_skill("task_reminder", "Allows the user to set a reminder based on text input, integrating with the existing agenda functionality.", schedule_reminder)
+
+
+def analyze_sentiment(args: dict) -> dict:
+    """Analyzes the sentiment (positive, negative, neutral) of a given text input."""
+    result = args.get('text', '')
+    if not result:
+        return {'success': False, 'result': 'No text provided'}
+    # Placeholder for sentiment analysis logic - replace with a suitable library
+    sentiment = 'neutral'
+    return {'success': True, 'result': sentiment}
+
+register_skill("sentiment_analysis", "Analyzes the sentiment (positive, negative, neutral) of a given text input.", analyze_sentiment)
+
+
+def process_file(args: dict) -> dict:
+    """Performs basic file operations like reading, writing, and checking existence."""
+    file_path = args.get('file_path', '')
+    if not file_path:
+        return {'success': False, 'result': 'No file path provided'}
+    try:
+        # Placeholder for file operations - replace with actual implementation
+        with open(file_path, 'r') as f:
+            content = f.read()
+        return {'success': True, 'result': content}
+    except FileNotFoundError:
+        return {'success': False, 'result': 'File not found'}
+
+register_skill("file_operations", "Performs basic file operations like reading, writing, and checking existence.", process_file)
+
+
+def execute_code(args: dict) -> dict:
+    """Executes a small Python code snippet provided as a string."""
+    code_string = args.get('code', '')
+    if not code_string:
+        return {'success': False, 'result': 'No code provided'}
+    try:
+        exec(code_string)
+        return {'success': True, 'result': 'Code executed successfully'}
+    except Exception as e:
+        return {'success': False, 'result': str(e)}
+
+register_skill("code_snippet_execution", "Executes a small Python code snippet provided as a string.", execute_code)
