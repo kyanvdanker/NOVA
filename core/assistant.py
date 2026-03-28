@@ -3,6 +3,7 @@ NOVA Assistant Brain — LLM interface, tool dispatch, conversation management.
 Uses Ollama with streaming for low latency.
 """
 import asyncio
+import base64
 import json
 import re
 import time
@@ -30,6 +31,43 @@ from core.tools import (
 
 # Tool regex: matches TOOL: <NAME> | <JSON>
 TOOL_PATTERN = re.compile(r"TOOL:\s*(\w+)\s*\|\s*(\{.*?\})", re.DOTALL)
+
+# MIME types that Ollama can handle as vision images
+_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
+
+# Plain-text or code extensions we can just embed in the prompt
+_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".html", ".css", ".json", ".yaml",
+    ".yml", ".csv", ".xml", ".sh", ".bash", ".env", ".toml", ".ini", ".cfg",
+    ".rs", ".go", ".java", ".cpp", ".c", ".h", ".rb", ".php", ".sql", ".log",
+}
+
+
+def _is_image_file(f: Dict) -> bool:
+    """Return True if the file dict represents an image Ollama can handle."""
+    mime = f.get("type", "")
+    name = f.get("name", "").lower()
+    return (
+        mime in _IMAGE_MIME_TYPES
+        or name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+    )
+
+
+def _extract_base64_data(data_url_or_b64: str) -> str:
+    """Strip the data-URL prefix if present, return raw base64."""
+    if data_url_or_b64.startswith("data:"):
+        _, _, b64 = data_url_or_b64.partition(",")
+        return b64
+    return data_url_or_b64
+
+
+def _decode_text_file(f: Dict) -> str:
+    """Decode a text/code file from base64 to a UTF-8 string."""
+    raw = _extract_base64_data(f.get("data", ""))
+    try:
+        return base64.b64decode(raw).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 class NOVAAssistant:
@@ -104,11 +142,52 @@ class NOVAAssistant:
                 print(f"\n  {ASSISTANT_NAME}: Shutting down. See you, {USER_NAME}.")
                 break
 
-    async def handle_input(self, text: str, voice_response: bool = False) -> str:
+    async def handle_input(self, text: str, voice_response: bool = False,
+                           files: List[Dict] = None) -> str:
+        """
+        Process user input, optionally with attached files.
+
+        files: list of dicts with keys:
+            name  – original filename
+            type  – MIME type (e.g. "image/png", "text/plain")
+            data  – base64-encoded content (data-URL or raw base64)
+        """
+        files = files or []
         start_time = time.time()
-        self.memory.add_message("user", text, self._session_id)
+
+        # ── Separate images from text-based files ──────────────────────────
+        image_files = [f for f in files if _is_image_file(f)]
+        text_files  = [f for f in files if not _is_image_file(f)]
+
+        # Build the user message content
+        user_message_text = text
+
+        # Embed text/code files directly into the prompt
+        if text_files:
+            parts = [text]
+            for f in text_files:
+                content = _decode_text_file(f)
+                ext = ""
+                name = f.get("name", "file")
+                if "." in name:
+                    ext = name.rsplit(".", 1)[-1]
+                fence = f"```{ext}\n{content}\n```" if ext else f"```\n{content}\n```"
+                parts.append(f"\n\n**Attached file – {name}:**\n{fence}")
+            user_message_text = "".join(parts)
+
+        self.memory.add_message("user", user_message_text, self._session_id)
         history = self.memory.get_recent_messages(n=15, session_id=self._session_id)
         messages = self._build_messages(history)
+
+        # Attach images to the last user message for multimodal models
+        if image_files:
+            last_msg = messages[-1]
+            if last_msg["role"] == "user":
+                last_msg["images"] = [
+                    _extract_base64_data(f["data"]) for f in image_files
+                ]
+            file_names = ", ".join(f["name"] for f in image_files)
+            print(f"  🖼  Sending {len(image_files)} image(s) to model: {file_names}")
 
         print(f"\n  {ASSISTANT_NAME}: ", end="", flush=True)
 
@@ -116,7 +195,6 @@ class NOVAAssistant:
         async for chunk in self._stream_response(messages):
             print(chunk, end="", flush=True)
             full_response += chunk
-            # Notify GUI callbacks
             for cb in self._stream_callbacks:
                 try:
                     cb("chunk", chunk)
@@ -222,7 +300,7 @@ class NOVAAssistant:
                             "stream": True,
                             "options": {"temperature": LLM_TEMPERATURE, "num_ctx": OLLAMA_CONTEXT_LENGTH}
                         },
-                        stream=True, timeout=120
+                        stream=True, timeout=300
                     )
                     for line in resp.iter_lines():
                         if line:
@@ -255,122 +333,82 @@ class NOVAAssistant:
     async def _execute_tool(self, tool_name: str, args: Dict) -> Dict:
         """Route tool calls to the appropriate handler."""
         tool_name = tool_name.upper()
-        # Extract 'action' but keep the rest of args intact
         action = args.pop("action", "")
 
-        # ── Core system tools ──
         if tool_name == "COMPUTER_CONTROL":
             return self.computer.execute(action, args)
-
         elif tool_name == "PROJECT_MANAGER":
             return self.projects.execute(action, args)
-
         elif tool_name == "MEMO":
             return await self._handle_memo(action, args)
-
         elif tool_name == "AGENDA":
             return self.agenda.execute(action, args)
-
         elif tool_name == "SELF_IMPROVE":
             return self._handle_self_improve(action, args)
-
         elif tool_name == "SYSTEM":
-            # Route to system_info or computer control
             if action in ("overview", "processes", "battery", "temperatures", "network_interfaces"):
                 return system_info_tool({"action": action, **args})
             return self.computer.execute(action, args)
-
         elif tool_name == "MEMORY":
             return self._handle_memory(action, args)
-
         elif tool_name == "CUSTOM_SKILL":
             skill_name = args.pop("skill", action)
             return self.self_improve.execute_custom_skill(skill_name, args)
-
-        # ── New tools ──
         elif tool_name == "CODE":
-            args["action"] = action
             return run_code_tool({"language": args.get("language", "python"),
                                    "code": args.get("code", "")})
-
         elif tool_name == "SEARCH":
             return search_tool({"query": args.get("query", action)})
-
         elif tool_name == "WEATHER":
             return weather_tool({"city": args.get("city", args.get("location", action or "Amsterdam"))})
-
         elif tool_name == "CALCULATE":
             return calculate_tool({"expression": args.get("expression", args.get("expr", action))})
-
         elif tool_name == "UNIT_CONVERT":
             return unit_convert_tool(args)
-
         elif tool_name == "HASH":
             return hash_tool(args)
-
         elif tool_name == "ENCODE":
             return encode_tool(args)
-
         elif tool_name == "JSON_TOOLS":
             return json_tool({"action": action, **args})
-
         elif tool_name == "REGEX":
             return regex_tool({"action": action, **args})
-
         elif tool_name == "DIFF":
             return diff_tool({"action": action, **args})
-
         elif tool_name == "NETWORK":
             return network_tool({"action": action, **args})
-
         elif tool_name == "FILE":
             return file_tool({"action": action, **args})
-
         elif tool_name == "CLIPBOARD":
             return clipboard_tool({"action": action, **args})
-
         elif tool_name == "PROCESS":
             return process_tool({"action": action, **args})
-
         elif tool_name == "TIMER":
             return timer_tool({"action": action, **args})
-
         elif tool_name == "DATETIME":
             return datetime_tool({"action": action, **args})
-
         elif tool_name == "PRICE":
             return price_tool({"action": action, **args})
-
         elif tool_name == "CURRENCY":
             return currency_tool(args)
-
         elif tool_name == "TRANSLATE":
             return translate_tool(args)
-
         elif tool_name == "TEXT":
             return text_tool({"action": action, **args})
-
         elif tool_name == "QR":
             return qr_tool({"action": action, **args})
-
         elif tool_name == "GIT":
             return git_tool({"action": action, **args})
-
         elif tool_name == "PACKAGE":
             return package_tool({"action": action, **args})
-
         elif tool_name == "GENERATE":
             return generate_tool({"action": action, **args})
-
         elif tool_name == "TEXT_ANALYZE":
             return text_analyze_tool({"action": action, **args})
-
         elif tool_name == "OCR":
             from core.tools import ocr_tool
             return ocr_tool(args)
-
         else:
-            # Try custom skills as fallback
             custom = self.self_improve.get_custom_skills()
             if tool_name.lower() in custom:
                 return self.self_improve.execute_custom_skill(tool_name.lower(), args)

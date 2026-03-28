@@ -23,7 +23,8 @@ from core.tools import system_info_tool, file_tool
 
 app = Flask(__name__, template_folder="public", static_folder="public")
 app.config["SECRET_KEY"] = "nova-secret-2025"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                    max_http_buffer_size=50 * 1024 * 1024)  # 50 MB for file uploads
 
 # Global assistant instance (set by main.py)
 _assistant = None
@@ -51,16 +52,15 @@ def chat():
     """Handle a chat message — streams response via SSE."""
     data = request.json
     text = data.get("message", "").strip()
-    if not text:
+    files = data.get("files", [])
+    if not text and not files:
         return jsonify({"error": "Empty message"}), 400
 
     def generate():
-        chunks = []
         done_event = threading.Event()
 
         def on_stream(event_type, data):
             if event_type == "chunk":
-                chunks.append(data)
                 socketio.emit("stream_chunk", {"chunk": data})
             elif event_type == "tool_result":
                 socketio.emit("tool_result", data)
@@ -72,7 +72,9 @@ def chat():
             _assistant.add_stream_callback(on_stream)
             try:
                 future = asyncio.run_coroutine_threadsafe(
-                    _assistant.handle_input(text, voice_response=False), _loop
+                    _assistant.handle_input(text or "(see attached file)",
+                                            voice_response=False,
+                                            files=files), _loop
                 )
                 result = future.result(timeout=120)
             except Exception as e:
@@ -194,16 +196,17 @@ def on_connect():
 @socketio.on("send_message")
 def on_message(data):
     text = data.get("message", "").strip()
-    if not text or not _assistant:
-        emit("error", {"message": "No message or assistant not ready"})
+    files = data.get("files", [])   # list of {name, type, data} dicts
+    if not text and not files:
+        emit("error", {"message": "No message or files provided"})
+        return
+    if not _assistant:
+        emit("error", {"message": "Assistant not ready"})
         return
 
     def run():
-        chunks = []
-
         def on_stream(event_type, payload):
             if event_type == "chunk":
-                chunks.append(payload)
                 socketio.emit("stream_chunk", {"chunk": payload})
             elif event_type == "tool_result":
                 socketio.emit("tool_result", payload)
@@ -213,7 +216,11 @@ def on_message(data):
         _assistant.add_stream_callback(on_stream)
         try:
             future = asyncio.run_coroutine_threadsafe(
-                _assistant.handle_input(text, voice_response=False), _loop
+                _assistant.handle_input(
+                    text or "(see attached file)",
+                    voice_response=False,
+                    files=files
+                ), _loop
             )
             future.result(timeout=120)
         except Exception as e:
