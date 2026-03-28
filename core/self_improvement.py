@@ -1,6 +1,9 @@
 """
-Self-Improvement Engine — NOVA analyzes its own usage, generates new skills,
+Self-Improvement Engine — NOVA analyses its own usage, generates new skills,
 and writes them into skills/custom_skills.py. Hot-reloaded automatically.
+
+Updated to use the same LLM_BACKEND switch as assistant.py so self-improvement
+queries go to whichever inference server is active (Ollama, llama.cpp, vLLM).
 """
 import ast
 import importlib
@@ -20,7 +23,8 @@ from config.settings import (
     OLLAMA_HOST, OLLAMA_MODEL,
     SELF_IMPROVE_ENABLED, SELF_IMPROVE_INTERVAL, SELF_IMPROVE_MIN_INTERACTIONS,
     SELF_IMPROVE_ALLOW_CORE_UPDATES,
-    BASE_DIR
+    BASE_DIR, LLM_BACKEND,
+    OLLAMA_KEEP_ALIVE,
 )
 
 CUSTOM_SKILLS_PATH = BASE_DIR / "skills" / "custom_skills.py"
@@ -58,8 +62,7 @@ class SelfImprovement:
         if not SELF_IMPROVE_ENABLED:
             return
         self._running = True
-        thread = threading.Thread(target=self._improvement_loop, daemon=True)
-        thread.start()
+        threading.Thread(target=self._improvement_loop, daemon=True).start()
         print("  🧠 Self-improvement engine started")
 
     def stop(self):
@@ -67,11 +70,9 @@ class SelfImprovement:
 
     def _improvement_loop(self):
         while self._running:
-            interactions = self.memory.get_total_interactions()
-            if interactions >= SELF_IMPROVE_MIN_INTERACTIONS:
+            if self.memory.get_total_interactions() >= SELF_IMPROVE_MIN_INTERACTIONS:
                 break
             time.sleep(60)
-
         while self._running:
             try:
                 self._run_improvement_cycle()
@@ -90,13 +91,11 @@ class SelfImprovement:
         response = self._query_llm(prompt)
         if not response:
             return
-
         suggestions = self._parse_suggestions(response)
         applied = 0
         for suggestion in suggestions[:3]:
             if self._apply_suggestion(suggestion):
                 applied += 1
-
         if applied > 0:
             print(f"  ✅ Applied {applied} improvement(s)")
             self._reload_skills()
@@ -112,20 +111,19 @@ class SelfImprovement:
                          if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")]
                 if funcs:
                     summaries.append(f"{f.name}: {', '.join(funcs[:8])}")
-            except:
+            except Exception:
                 pass
-        existing_skills = CUSTOM_SKILLS_PATH.read_text(encoding="utf-8") if CUSTOM_SKILLS_PATH.exists() else ""
-        return "\n".join(summaries) + "\n\nCustom skills:\n" + existing_skills[:500]
+        existing = CUSTOM_SKILLS_PATH.read_text(encoding="utf-8") if CUSTOM_SKILLS_PATH.exists() else ""
+        return "\n".join(summaries) + "\n\nCustom skills:\n" + existing[:500]
 
-    def _build_improvement_prompt(self, stats: Dict, recent: List, skills: List, source: str) -> str:
-        stats_str = json.dumps(stats, indent=2)
-        skill_names = [s["skill_name"] for s in skills]
-        return f"""You are NOVA's self-improvement module. Analyze usage patterns and propose new Python skills.
+    def _build_improvement_prompt(self, stats: Dict, recent: List,
+                                  skills: List, source: str) -> str:
+        return f"""You are NOVA's self-improvement module. Analyse usage patterns and propose new Python skills.
 
 Usage stats (last 7 days):
-{stats_str}
+{json.dumps(stats, indent=2)}
 
-Existing custom skills: {skill_names}
+Existing custom skills: {[s["skill_name"] for s in skills]}
 
 Current capabilities summary:
 {source}
@@ -139,7 +137,7 @@ Respond ONLY with a JSON array:
     "name": "skill_name",
     "func_name": "function_name",
     "description": "What it does",
-    "code": "    result = args.get('input', '')\n    return {{'success': True, 'result': result}}"
+    "code": "    result = args.get('input', '')\\n    return {{'success': True, 'result': result}}"
   }}
 ]
 
@@ -151,15 +149,45 @@ Rules:
 - ONLY return the JSON array, nothing else"""
 
     def _query_llm(self, prompt: str) -> Optional[str]:
+        """
+        Query the active LLM backend for a non-streaming completion.
+
+        Ollama   → POST /api/generate   (native, stream:false)
+        Others   → POST /v1/chat/completions  (OpenAI-compat, stream:false)
+        """
         try:
-            resp = requests.post(
-                f"{OLLAMA_HOST}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0.3}},
-                timeout=60
-            )
-            if resp.status_code == 200:
-                return resp.json().get("response", "")
+            if LLM_BACKEND == "ollama":
+                resp = requests.post(
+                    f"{OLLAMA_HOST}/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": OLLAMA_KEEP_ALIVE,
+                        "options": {"temperature": 0.3},
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("response", "")
+            else:
+                # OpenAI-compatible non-streaming completion
+                resp = requests.post(
+                    f"{OLLAMA_HOST}/v1/chat/completions",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "stream": False,
+                        "temperature": 0.3,
+                        "max_tokens": 1024,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    return (resp.json()
+                            .get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", ""))
         except Exception as e:
             print(f"  LLM query failed: {e}")
         return None
@@ -167,7 +195,7 @@ Rules:
     def _parse_suggestions(self, response: str) -> List[Dict]:
         try:
             start = response.find("[")
-            end = response.rfind("]") + 1
+            end   = response.rfind("]") + 1
             if start >= 0 and end > start:
                 return json.loads(response[start:end])
         except json.JSONDecodeError:
@@ -175,36 +203,31 @@ Rules:
         suggestions = []
         try:
             import re
-            matches = re.findall(r'\{[^{}]*"name"[^{}]*\}', response, re.DOTALL)
-            for m in matches:
+            for m in re.findall(r'\{[^{}]*"name"[^{}]*\}', response, re.DOTALL):
                 try:
                     suggestions.append(json.loads(m))
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
         return suggestions
 
     def _apply_suggestion(self, suggestion: Dict) -> bool:
-        """Validate and apply a code suggestion. FIXED version."""
         required = ["name", "func_name", "description", "code"]
         if not all(k in suggestion for k in required):
             return False
 
-        name = suggestion["name"]
-        func_name = suggestion["func_name"]
+        name        = suggestion["name"]
+        func_name   = suggestion["func_name"]
         description = suggestion["description"].replace('"', "'")
-        code = suggestion["code"]
+        code        = suggestion["code"]
 
-        # Validate Python syntax
         try:
-            full_code = f"def {func_name}(args: dict):\n{code}"
-            ast.parse(full_code)
+            ast.parse(f"def {func_name}(args: dict):\n{code}")
         except SyntaxError as e:
             print(f"  ⚠️  Syntax error in skill '{name}': {e}")
             return False
 
-        # Determine target file
         target_file = suggestion.get("target_file")
         if target_file:
             write_path = (BASE_DIR / target_file).resolve()
@@ -219,42 +242,34 @@ Rules:
 
         try:
             existing = write_path.read_text(encoding="utf-8") if write_path.exists() else ""
-
-            # Check for duplicates
             if f'register_skill("{name}"' in existing or f"def {func_name}(" in existing:
                 return False
 
-            # Build skill code — FIXED string formatting (no nested f-string issues)
-            lines = [
-                "",
-                "",
-                f"def {func_name}(args: dict) -> dict:",
-                f'    """{description}"""',
-            ]
-            for line in code.splitlines():
-                lines.append(line)
+            lines = ["", "",
+                     f"def {func_name}(args: dict) -> dict:",
+                     f'    """{description}"""']
+            lines += code.splitlines()
             lines.append("")
-
             if write_path == CUSTOM_SKILLS_PATH:
                 lines.append(f'register_skill("{name}", "{description}", {func_name})')
                 lines.append("")
 
-            skill_code = "\n".join(lines)
-
             with open(write_path, "a", encoding="utf-8") as f:
-                f.write(skill_code)
+                f.write("\n".join(lines))
 
+            full_code = f"def {func_name}(args: dict):\n{code}"
             self.memory.add_skill(name, description, full_code)
             self._write_improvement_log({
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "skill_name": name,
-                "func_name": func_name,
+                "timestamp":   datetime.utcnow().isoformat() + "Z",
+                "skill_name":  name,
+                "func_name":   func_name,
                 "description": description,
-                "code": code,
-                "source": "self_improvement",
-                "target_file": str(write_path.relative_to(BASE_DIR))
+                "code":        code,
+                "source":      "self_improvement",
+                "backend":     LLM_BACKEND,
+                "target_file": str(write_path.relative_to(BASE_DIR)),
             })
-            print(f"  ✨ New skill added: {name} — {description}")
+            print(f"  ✨ New skill: {name} — {description}")
             return True
         except Exception as e:
             print(f"  ⚠️  Failed to write skill '{name}': {e}")
@@ -288,7 +303,8 @@ Rules:
     def execute_custom_skill(self, skill_name: str, args: Dict) -> Dict:
         skills = self.get_custom_skills()
         if skill_name not in skills:
-            return {"error": f"Unknown custom skill: {skill_name}", "available": list(skills.keys())}
+            return {"error": f"Unknown custom skill: {skill_name}",
+                    "available": list(skills.keys())}
         try:
             return skills[skill_name]["func"](args)
         except Exception as e:
@@ -304,9 +320,10 @@ Rules:
     def get_status(self) -> Dict:
         skills = self.get_custom_skills()
         return {
-            "enabled": SELF_IMPROVE_ENABLED,
-            "cycles_completed": self._cycle_count,
-            "custom_skills": list(skills.keys()),
-            "next_cycle_in": SELF_IMPROVE_INTERVAL,
-            "total_interactions": self.memory.get_total_interactions()
+            "enabled":           SELF_IMPROVE_ENABLED,
+            "cycles_completed":  self._cycle_count,
+            "custom_skills":     list(skills.keys()),
+            "next_cycle_in":     SELF_IMPROVE_INTERVAL,
+            "total_interactions":self.memory.get_total_interactions(),
+            "llm_backend":       LLM_BACKEND,
         }

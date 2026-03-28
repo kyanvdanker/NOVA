@@ -8,12 +8,60 @@ BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 SKILLS_DIR = BASE_DIR / "skills"
 
-# ─── Ollama / LLM ────────────────────────────────────────────────────────────
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3")
-OLLAMA_CONTEXT_LENGTH = 8192
+# ─── LLM Backend ─────────────────────────────────────────────────────────────
+#
+# LLM_BACKEND controls which inference server NOVA talks to.
+#
+#   "ollama"   — Ollama native API            (default, http://localhost:11434)
+#   "llamacpp" — llama.cpp --server mode      (http://localhost:8080)
+#   "vllm"     — vLLM OpenAI-compatible API   (http://localhost:8000)
+#
+# llamacpp and vllm both expose the OpenAI /v1/chat/completions endpoint.
+# Continuous batching is on by default in both; that's the main latency win.
+#
+# Quick-start commands:
+#
+#   llama.cpp:
+#     ./llama-server -m model.gguf \
+#       --ctx-size 8192 \
+#       --cont-batching \       ← continuous batching (key for throughput)
+#       --parallel 4 \          ← up to 4 concurrent sequences
+#       --flash-attn \          ← flash attention (big speed win on GPU)
+#       --host 0.0.0.0 --port 8080
+#
+#   vLLM:
+#     python -m vllm.entrypoints.openai.api_server \
+#       --model google/gemma-3-4b-it \
+#       --dtype bfloat16 \
+#       --max-model-len 8192 \
+#       --port 8000
+#
+LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").lower()  # ollama | llamacpp | vllm
+
+_BACKEND_HOST_DEFAULTS = {
+    "ollama":   "http://localhost:11434",
+    "llamacpp": "http://localhost:8080",
+    "vllm":     "http://localhost:8000",
+}
+
+# Override any backend's host via LLM_HOST env var
+OLLAMA_HOST = os.getenv("LLM_HOST", _BACKEND_HOST_DEFAULTS.get(LLM_BACKEND, "http://localhost:11434"))
+
+# Model name:
+#   ollama   → short name,       e.g. "gemma3"
+#   llamacpp → ignored by server but must be non-empty, e.g. "local-model"
+#   vllm     → HuggingFace id,   e.g. "google/gemma-3-4b-it"
+OLLAMA_MODEL = os.getenv("LLM_MODEL", "gemma3")
+
+OLLAMA_CONTEXT_LENGTH = int(os.getenv("LLM_CTX", "8192"))
 LLM_TEMPERATURE = 0.7
-LLM_STREAM = True
+LLM_STREAM = True  # always True — streaming is used everywhere
+
+# ── Ollama-only latency knobs (silently ignored for llamacpp / vllm) ──────────
+# keep_alive "-1" → model stays in VRAM/RAM forever (no cold-start tax)
+# num_keep   -1   → cache the entire system prompt in the KV-cache across turns
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
+OLLAMA_NUM_KEEP   = int(os.getenv("OLLAMA_NUM_KEEP", "-1"))
 
 # ─── Voice / Wake Word ────────────────────────────────────────────────────────
 PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY", "")
@@ -227,7 +275,7 @@ SELF_IMPROVE — Self-improvement engine
   {{"action": "list_skills"}}
 
 CUSTOM_SKILL — Execute a learned skill
-  {{"action": "execute", "skill": "get_weather", "city": "London"}}
+  {{"action": "execute", "skill": "get_weather", "city": "Utrecht"}}
 
 ─── RULES ───────────────────────────────────────────────────────────────────
 - ALWAYS use the most specific tool for the job
