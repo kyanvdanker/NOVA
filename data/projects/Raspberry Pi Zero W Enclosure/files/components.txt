@@ -1,0 +1,17 @@
+## Components
+*   Raspberry Pi Zero W
+*   USB Microphone (Adafruit I2S Mic)
+*   Amplified Speaker (PAM8403)
+*   3D Printed Enclosure
+*   USB Power Supply
+*   Jumper Wires (for connections)
+*   Breadboard (for prototyping)
+
+## Estimated Cost
+*   Raspberry Pi Zero W: $15
+*   Microphone: $10
+*   Speaker: $5
+*   3D Printing Filament: $10-20 (depending on material)
+*   Power Supply: $5-10
+
+Total Estimated Cost: $45-65

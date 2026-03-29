@@ -90,7 +90,7 @@ async def main(args):
             # Keep async loop alive
             try:
                 while True:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep()
             except asyncio.CancelledError:
                 pass
 
