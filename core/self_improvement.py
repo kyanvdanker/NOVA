@@ -166,7 +166,7 @@ Rules:
                         "keep_alive": OLLAMA_KEEP_ALIVE,
                         "options": {"temperature": 0.3},
                     },
-                    timeout=60,
+                    timeout=600,
                 )
                 if resp.status_code == 200:
                     return resp.json().get("response", "")

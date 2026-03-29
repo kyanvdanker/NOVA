@@ -54,7 +54,7 @@ OLLAMA_HOST = os.getenv("LLM_HOST", _BACKEND_HOST_DEFAULTS.get(LLM_BACKEND, "htt
 OLLAMA_MODEL = os.getenv("LLM_MODEL", "gemma3")
 
 OLLAMA_CONTEXT_LENGTH = int(os.getenv("LLM_CTX", "8192"))
-LLM_TEMPERATURE = 0.7
+LLM_TEMPERATURE = 0.1
 LLM_STREAM = True  # always True — streaming is used everywhere
 
 # ── Ollama-only latency knobs (silently ignored for llamacpp / vllm) ──────────
